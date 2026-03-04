@@ -1,0 +1,27 @@
+apiVersion: jumpstarter.dev/v1alpha1
+kind: ExporterConfig
+metadata:
+  namespace: default
+  name: demo
+endpoint: grpc.jumpstarter.192.168.0.203.nip.io:8082
+token: "<token>"
+export:
+  west:
+    type: jumpstarter_driver_west.driver.West
+    config:
+      # Required: Path to the workspace directory
+      workspace_path: "/home/exporter/zephyr-workspace"
+
+      # Optional: Override zephyr location (defaults to {workspace_path}/zephyr)
+      # zephyr_base: "/custom/path/to/zephyr"
+
+      # Optional: SDK path (can be installed via install_sdk command)
+      # sdk_path: "/opt/zephyr-sdk-0.16.5"
+
+      # Optional: Configure flash runner and additional arguments
+      # The runner is controlled by the exporter admin, not by developers
+      extra_flash_args:
+        - "--runner"
+        - "openocd"  # or "jlink", "pyocd", etc.
+        # - "--openocd"  # Custom OpenOCD path if needed
+        # - "/custom/path/to/openocd"
