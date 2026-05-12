@@ -1,13 +1,16 @@
 # Copyright (c) 2026 BayLibre
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
+import asyncio.subprocess
 import os
 import shutil
-import subprocess
 import sys
 import tarfile
 import tempfile
+from collections import deque
 from dataclasses import dataclass, field
+from typing import AsyncGenerator
 
 from anyio.streams.file import FileReadStream, FileWriteStream
 
@@ -26,7 +29,7 @@ class West(Driver):
     - Initialize and update Zephyr workspaces
     - Install the Zephyr SDK
     - Flash firmware to remote boards
-    - (Future) Run twister tests on remote hardware
+    - Run twister tests on remote hardware
     """
 
     workspace_path: str
@@ -94,8 +97,54 @@ class West(Driver):
                 f"Zephyr SDK directory does not exist: {self.sdk_path}\nRun 'install_sdk' to install the Zephyr SDK."
             )
 
+    async def _stream_cmd(
+        self,
+        cmd: list[str],
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """Run a subprocess and yield merged stdout/stderr line by line.
+
+        Each line is yielded to the caller as soon as it's available, which gives
+        the client a live view of progress and — equally important for long runs
+        like twister — keeps the gRPC stream active so HTTP/2 keepalive pings
+        don't trip ``UNAVAILABLE: ping timeout``.
+
+        Raises RuntimeError if the process exits non-zero; the message includes
+        the tail of the output for context.
+        """
+        if env is None:
+            env = self._build_env()
+
+        self.logger.debug("Running command: %s", " ".join(cmd))
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=cwd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        assert process.stdout is not None
+
+        tail: deque[str] = deque(maxlen=50)
+        async for raw in process.stdout:
+            # west / git progress sometimes uses CR; strip both so log viewers
+            # don't render control chars.
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            tail.append(line)
+            yield line
+
+        rc = await process.wait()
+        if rc != 0:
+            tail_text = "\n".join(tail)
+            raise RuntimeError(
+                f"{cmd[0]} {cmd[1] if len(cmd) > 1 else ''} failed (rc={rc}):\n{tail_text}"
+            )
+
     @export
-    async def flash(self, src: str) -> str:
+    async def flash(self, src: str) -> AsyncGenerator[str, None]:
         """Flash firmware to the target board using a build directory archive
 
         Receives a tar archive of the Zephyr build directory, extracts it to a
@@ -109,8 +158,8 @@ class West(Driver):
         Args:
             src: Streaming resource handle for the build directory tar archive
 
-        Returns:
-            Command output
+        Yields:
+            Command output lines as they are produced.
         """
         self._validate_paths()
 
@@ -127,18 +176,19 @@ class West(Driver):
             with tarfile.open(archive_path) as tar:
                 tar.extractall(build_dir)
 
-            cmd = ["flash", "--no-rebuild", "--build-dir", build_dir]
+            cmd = [self.west_path, "flash", "--no-rebuild", "--build-dir", build_dir]
             cmd.extend(self.extra_flash_args)
 
-            return self._run_cmd(cmd)
+            async for line in self._stream_cmd(cmd, cwd=self.zephyr_base):
+                yield line
 
     @export
-    def initialize_workspace(
+    async def initialize_workspace(
         self,
         manifest_url: str = "https://github.com/zephyrproject-rtos/zephyr",
         manifest_rev: str | None = None,
         manifest_file: str | None = None,
-    ) -> str:
+    ) -> AsyncGenerator[str, None]:
         """Initialize a Zephyr workspace using west init
 
         Sets up a new Zephyr workspace on the exporter. This command:
@@ -152,136 +202,81 @@ class West(Driver):
                          If None, uses the default branch
             manifest_file: Manifest file to use (default: west.yml)
 
-        Returns:
-            Command output
-
-        Example:
-            # Initialize with latest Zephyr
-            initialize_workspace()
-
-            # Initialize with specific version
-            initialize_workspace(manifest_rev="v3.5.0")
-
-            # Initialize with custom manifest
-            initialize_workspace(
-                manifest_url="https://github.com/myorg/zephyr-manifest",
-                manifest_rev="main"
-            )
+        Yields:
+            Command output lines as they are produced.
         """
         west_config = os.path.join(self.workspace_path, ".west")
 
-        # Check if workspace is already initialized
         if os.path.exists(west_config):
-            self.logger.info("Workspace already initialized at %s", self.workspace_path)
-            output = "Workspace already initialized\n"
+            yield f"Workspace already initialized at {self.workspace_path}"
         else:
-            # Run west init
             cmd = [self.west_path, "init"]
-
             if manifest_file:
                 cmd.extend(["-m", manifest_file])
-
             if manifest_rev:
                 cmd.extend(["--mr", manifest_rev])
-
             cmd.append(self.workspace_path)
 
-            self.logger.info("Initializing workspace at %s", self.workspace_path)
-            self.logger.debug("Running command: %s", " ".join(cmd))
+            yield f"Initializing workspace at {self.workspace_path}"
+            async for line in self._stream_cmd(cmd):
+                yield line
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                env=os.environ.copy(),
-            )
-
-            if result.returncode != 0:
-                self.logger.error("Error initializing workspace: %s", result.stderr)
-                raise RuntimeError(f"West init failed: {result.stderr}")
-
-            output = result.stdout
-
-        # If manifest_rev was specified and workspace was already initialized,
-        # checkout the requested revision
         if manifest_rev and os.path.exists(west_config):
             manifest_dir = os.path.join(self.workspace_path, "zephyr")
             if os.path.exists(manifest_dir):
-                self.logger.info("Checking out revision %s", manifest_rev)
-                git_cmd = ["git", "checkout", manifest_rev]
-                result = subprocess.run(
-                    git_cmd,
-                    capture_output=True,
-                    text=True,
+                yield f"Checking out revision {manifest_rev}"
+                async for line in self._stream_cmd(
+                    ["git", "checkout", manifest_rev],
                     cwd=manifest_dir,
-                    env=os.environ.copy(),
-                )
+                ):
+                    yield line
 
-                if result.returncode != 0:
-                    self.logger.error("Error checking out revision: %s", result.stderr)
-                    raise RuntimeError(f"Git checkout failed: {result.stderr}")
-
-                output += result.stdout
-
-        # Run west update to fetch dependencies
-        self.logger.info("Updating workspace dependencies")
-        update_output = self.update_workspace()
-        output += "\n" + update_output
-
-        return output
+        async for line in self._update_workspace():
+            yield line
 
     @export
-    def update_workspace(self) -> str:
+    async def update_workspace(self) -> AsyncGenerator[str, None]:
         """Update workspace dependencies using west update
 
         Fetches and updates all projects defined in the west manifest.
         This is equivalent to running 'west update' in the workspace.
 
-        Returns:
-            Command output
-
-        Example:
-            update_workspace()
+        Yields:
+            Command output lines as they are produced.
         """
+        async for line in self._update_workspace():
+            yield line
+
+    async def _update_workspace(self) -> AsyncGenerator[str, None]:
+        """Shared body for update_workspace / initialize_workspace post-init."""
         west_config = os.path.join(self.workspace_path, ".west")
         if not os.path.exists(west_config):
-            raise ValueError(f"Workspace not initialized at {self.workspace_path}. Run 'initialize_workspace' first.")
+            raise ValueError(
+                f"Workspace not initialized at {self.workspace_path}. "
+                "Run 'initialize_workspace' first."
+            )
 
-        cmd = [self.west_path, "update"]
-        self.logger.info("Updating workspace dependencies")
-        self.logger.debug("Running command: %s", " ".join(cmd))
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
+        yield "Updating workspace dependencies"
+        async for line in self._stream_cmd(
+            [self.west_path, "update"],
             cwd=self.workspace_path,
-            env=os.environ.copy(),
-        )
-
-        if result.returncode != 0:
-            self.logger.error("Error updating workspace: %s", result.stderr)
-            raise RuntimeError(f"West update failed: {result.stderr}")
-
-        output = result.stdout
+        ):
+            yield line
 
         req_file = os.path.join(self.zephyr_base, "scripts", "requirements.txt")
         if os.path.isfile(req_file):
-            self.logger.info("Installing Python requirements from %s", req_file)
+            yield f"Installing Python requirements from {req_file}"
             if shutil.which("uv"):
                 pip_cmd = ["uv", "pip", "install", "-r", req_file]
             else:
                 pip_cmd = [sys.executable, "-m", "pip", "install", "-r", req_file]
-            pip_result = subprocess.run(pip_cmd, capture_output=True, text=True)
-            if pip_result.returncode != 0:
-                self.logger.error("Error installing requirements: %s", pip_result.stderr)
-                raise RuntimeError(f"pip install failed: {pip_result.stderr}")
-            output += pip_result.stdout
-
-        return output
+            async for line in self._stream_cmd(pip_cmd):
+                yield line
 
     @export
-    def install_sdk(self, toolchains: list[str] | None = None) -> str:
+    async def install_sdk(
+        self, toolchains: list[str] | None = None
+    ) -> AsyncGenerator[str, None]:
         """Install Zephyr SDK using west sdk install
 
         Downloads and installs the Zephyr SDK. The SDK will be installed in the
@@ -291,51 +286,32 @@ class West(Driver):
             toolchains: List of specific toolchains to install (e.g., ['arm', 'riscv'])
                        If None, installs all available toolchains
 
-        Returns:
-            Command output
-
-        Example:
-            # Install all toolchains
-            install_sdk()
-
-            # Install specific toolchains
-            install_sdk(toolchains=["arm", "riscv"])
+        Yields:
+            Command output lines as they are produced.
         """
         if not self.sdk_path:
             raise ValueError(
-                "sdk_path must be configured to use install_sdk. Set sdk_path in the driver configuration."
+                "sdk_path must be configured to use install_sdk. "
+                "Set sdk_path in the driver configuration."
             )
 
-        # Create SDK directory if it doesn't exist
         os.makedirs(self.sdk_path, exist_ok=True)
 
         cmd = [self.west_path, "sdk", "install"]
-
         if toolchains:
             cmd.extend(["-t", ",".join(toolchains)])
 
-        self.logger.info("Installing Zephyr SDK to %s", self.sdk_path)
-        self.logger.debug("Running command: %s", " ".join(cmd))
-
-        env = os.environ.copy()
+        env = self._build_env()
         env["ZEPHYR_SDK_INSTALL_DIR"] = self.sdk_path
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=self.workspace_path,
-            env=env,
-        )
-
-        if result.returncode != 0:
-            self.logger.error("Error installing SDK: %s", result.stderr)
-            raise RuntimeError(f"West SDK install failed: {result.stderr}")
-
-        return result.stdout
+        yield f"Installing Zephyr SDK to {self.sdk_path}"
+        async for line in self._stream_cmd(cmd, cwd=self.workspace_path, env=env):
+            yield line
 
     @export
-    async def twister(self, src: str, test_roots: list[str]) -> str:
+    async def twister(
+        self, src: str, test_roots: list[str]
+    ) -> AsyncGenerator[str, None]:
         """Run twister in test-only mode using a pre-built twister-out archive
 
         Receives a tar.gz archive produced by the build server (containing the
@@ -348,8 +324,8 @@ class West(Driver):
             src: Streaming resource handle for the twister-out tar.gz archive
             test_roots: List of test root paths passed to twister via ``-T``
 
-        Returns:
-            Command output
+        Yields:
+            Command output lines as they are produced.
         """
         if not self.hardware_map:
             raise ValueError(
@@ -387,29 +363,16 @@ class West(Driver):
         for root in test_roots:
             cmd.extend(["-T", root])
 
-        env = self._build_env()
+        yield f"Running twister with hardware map {self.hardware_map}"
+        async for line in self._stream_cmd(cmd, cwd=self.workspace_path):
+            yield line
 
-        self.logger.info("Running twister with hardware map %s", self.hardware_map)
-        self.logger.debug("Running command: %s", " ".join(cmd))
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=self.workspace_path,
-        )
-
-        if result.returncode != 0:
-            self.logger.error("Twister failed: %s", result.stderr)
-            raise RuntimeError(f"Twister failed: {result.stderr}")
-
-        self.logger.info("Compressing twister results")
+        yield "Compressing twister results"
         result_archive = os.path.join(self.workspace_path, "twister-out-result.tar.gz")
+        # tarfile.add walks the tree synchronously; for typical twister-out sizes
+        # (tens of MB) this is fast enough that we don't bother offloading it.
         with tarfile.open(result_archive, "w:gz") as tar:
             tar.add(twister_out, arcname="twister-out")
-
-        return result.stdout
 
     @export
     async def twister_fetch_results(self, dst: str) -> None:
@@ -434,35 +397,6 @@ class West(Driver):
         finally:
             os.unlink(result_archive)
 
-    def _run_cmd(self, cmd: list[str]) -> str:
-        """Run a west command with proper environment setup
-
-        Args:
-            cmd: Command arguments (without 'west' prefix)
-
-        Returns:
-            Command output (stdout)
-        """
-        full_cmd = [self.west_path, *cmd]
-        env = self._build_env()
-
-        self.logger.debug("Running command: %s", " ".join(full_cmd))
-
-        result = subprocess.run(
-            full_cmd,
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=self.zephyr_base,
-        )
-
-        if result.returncode != 0:
-            self.logger.error("Error running %s: %s", full_cmd, result.stderr)
-            raise RuntimeError(f"West command failed: {result.stderr}")
-
-        self.logger.debug("Command output: %s", result.stdout)
-        return result.stdout
-
     def _build_env(self) -> dict[str, str]:
         """Build environment variables for west commands
 
@@ -471,5 +405,8 @@ class West(Driver):
         """
         env = os.environ.copy()
         env["ZEPHYR_BASE"] = self.zephyr_base
-        env["ZEPHYR_SDK_INSTALL_DIR"] = self.sdk_path
+        # Only set ZEPHYR_SDK_INSTALL_DIR if configured — otherwise
+        # subprocess.Popen / asyncio.create_subprocess_exec choke on a None value.
+        if self.sdk_path:
+            env["ZEPHYR_SDK_INSTALL_DIR"] = self.sdk_path
         return env
