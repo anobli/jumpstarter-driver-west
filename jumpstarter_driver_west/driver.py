@@ -308,20 +308,34 @@ class West(Driver):
         async for line in self._stream_cmd(cmd, cwd=self.workspace_path, env=env):
             yield line
 
+
+    def get_compression_from_tarfile(self, filepath: str) -> str:
+        for compression in ('gz', 'bz2', 'xz'):
+            try:
+                mode = f"r:{compression}"
+                with tarfile.open(filepath, mode) as tar:
+                    return compression
+            except tarfile.ReadError:
+                continue
+        return None
+
     @export
     async def twister(
         self, src: str, test_roots: list[str]
     ) -> AsyncGenerator[str, None]:
         """Run twister in test-only mode using a pre-built twister-out archive
 
-        Receives a tar.gz archive produced by the build server (containing the
+        Receives a tar archive produced by the build server (containing the
         ``twister-out`` directory), extracts it into the workspace, then runs
         ``west twister --test-only --device-testing``. The updated
         ``twister-out`` directory is compressed and kept on the exporter until
         ``twister_fetch_results`` is called.
 
+        The archive can be in any format supported by tarfile (tar, tar.gz, tar.bz2, tar.xz).
+        The output will use the same compression format as the input.
+
         Args:
-            src: Streaming resource handle for the twister-out tar.gz archive
+            src: Streaming resource handle for the twister-out tar archive
             test_roots: List of test root paths passed to twister via ``-T``
 
         Yields:
@@ -341,12 +355,15 @@ class West(Driver):
             )
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            archive_path = os.path.join(tmpdir, "twister-out.tar.gz")
+            archive_path = os.path.join(tmpdir, "twister-out.tar")
 
             async with await FileWriteStream.from_path(archive_path) as stream:
                 async with self.resource(src) as res:
                     async for chunk in res:
                         await stream.send(chunk)
+
+            # Detect the compression format from the input archive
+            compression = self.get_compression_from_tarfile(archive_path)
 
             with tarfile.open(archive_path, "r:*") as tar:
                 tar.extractall(self.workspace_path)
@@ -367,28 +384,48 @@ class West(Driver):
         async for line in self._stream_cmd(cmd, cwd=self.workspace_path):
             yield line
 
-        yield "Compressing twister results"
-        result_archive = os.path.join(self.workspace_path, "twister-out-result.tar.gz")
+        # Use the same compression format as the input
+        compression_suffix = f".{compression}" if compression else ""
+        result_archive = os.path.join(
+            self.workspace_path, f"twister-out-result.tar{compression_suffix}"
+        )
+        write_mode = f"w:{compression}" if compression else "w"
+
+        yield f"Compressing twister results using {compression or 'no compression'}"
         # tarfile.add walks the tree synchronously; for typical twister-out sizes
         # (tens of MB) this is fast enough that we don't bother offloading it.
-        with tarfile.open(result_archive, "w:gz") as tar:
+        with tarfile.open(result_archive, write_mode) as tar:
             tar.add(twister_out, arcname="twister-out")
 
     @export
     async def twister_fetch_results(self, dst: str) -> None:
         """Stream the twister result archive back to the client
 
-        Streams the ``twister-out-result.tar.gz`` archive produced by the last
+        Streams the ``twister-out-result.tar*`` archive produced by the last
         ``twister`` call to the client and removes it from the exporter.
+        The archive format matches the input format used in the twister call.
 
         Args:
             dst: Streaming resource handle to write the result archive to
         """
-        result_archive = os.path.join(self.workspace_path, "twister-out-result.tar.gz")
-        if not os.path.exists(result_archive):
+        import glob
+
+        # Find the result archive with any compression format
+        pattern = os.path.join(self.workspace_path, "twister-out-result.tar*")
+        matches = glob.glob(pattern)
+
+        if not matches:
             raise FileNotFoundError(
                 "No twister results found on exporter. Run twister first."
             )
+
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Multiple twister result archives found: {matches}. "
+                "Clean up the workspace before running twister again."
+            )
+
+        result_archive = matches[0]
         try:
             async with await FileReadStream.from_path(result_archive) as file_stream:
                 async with self.resource(dst) as res:

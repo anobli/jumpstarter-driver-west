@@ -122,13 +122,16 @@ class WestClient(DriverClient):
     ) -> Iterator[str]:
         """Run twister in test-only mode using a pre-built twister-out archive
 
-        Streams a tar.gz archive to the exporter, which extracts it and runs
+        Streams a tar archive to the exporter, which extracts it and runs
         ``west twister --test-only --device-testing``. The updated results are
         kept on the exporter; call ``twister_fetch_results`` to retrieve them.
 
+        Supports any tar format (tar, tar.gz, tar.bz2, tar.xz). The output
+        will use the same compression format as the input.
+
         Args:
             operator: OpenDAL operator for file access
-            path: Path to the twister-out tar.gz archive
+            path: Path to the twister-out tar archive (any compression format)
             test_roots: List of test root paths passed to twister via ``-T``
 
         Yields:
@@ -140,8 +143,9 @@ class WestClient(DriverClient):
     def twister_fetch_results(self, operator: Operator, path: str) -> None:
         """Fetch the twister result archive from the exporter
 
-        Downloads the ``twister-out-result.tar.gz`` produced by the last
-        ``twister`` call and writes it to ``path``.
+        Downloads the twister result archive produced by the last ``twister``
+        call and writes it to ``path``. The archive format will match the
+        format of the input archive.
 
         Args:
             operator: OpenDAL operator for file access
@@ -155,16 +159,16 @@ class WestClient(DriverClient):
 
         Streams the archive to the exporter, runs twister yielding output lines
         as they arrive, then downloads the updated results back, overwriting
-        the original archive.
+        the original archive. The output format will match the input format.
 
         Args:
-            archive_path: Local path to the twister-out tar.gz archive
+            archive_path: Local path to the twister-out tar archive (any compression format)
             test_roots: List of test root paths passed to twister via ``-T``
 
         Yields:
             Command output lines, in real time. After the generator is
             exhausted, ``archive_path`` has been overwritten with the updated
-            results.
+            results in the same compression format.
         """
         absolute = Path(archive_path).resolve()
         tmp_path = absolute.parent / (absolute.name + ".tmp")
@@ -254,7 +258,9 @@ class WestClient(DriverClient):
         def twister(archive, test_roots):
             """Run twister tests on the exporter using a pre-built archive
 
-            ARCHIVE is the path to the twister-out tar.gz produced by the build server.
+            ARCHIVE is the path to the twister-out tar archive produced by the build server.
+            Supports any tar format (tar, tar.gz, tar.bz2, tar.xz). The output will use
+            the same compression format as the input.
 
             The hardware map is configured on the exporter via the driver configuration.
             """
