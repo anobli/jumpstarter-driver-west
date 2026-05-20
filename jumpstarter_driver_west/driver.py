@@ -381,8 +381,15 @@ class West(Driver):
             cmd.extend(["-T", root])
 
         yield f"Running twister with hardware map {self.hardware_map}"
-        async for line in self._stream_cmd(cmd, cwd=self.workspace_path):
-            yield line
+
+        # Capture any test failures but continue to compress results
+        test_error = None
+        try:
+            async for line in self._stream_cmd(cmd, cwd=self.workspace_path):
+                yield line
+        except RuntimeError as e:
+            test_error = e
+            yield f"Twister test failed: {e}"
 
         # Use the same compression format as the input
         compression_suffix = f".{compression}" if compression else ""
@@ -396,6 +403,9 @@ class West(Driver):
         # (tens of MB) this is fast enough that we don't bother offloading it.
         with tarfile.open(result_archive, write_mode) as tar:
             tar.add(twister_out, arcname="twister-out")
+
+        if test_error:
+            yield "Results compressed and ready for retrieval despite test failure"
 
     @export
     async def twister_fetch_results(self, dst: str) -> None:
