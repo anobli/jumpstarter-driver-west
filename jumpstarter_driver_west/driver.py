@@ -3,6 +3,7 @@
 
 import asyncio
 import asyncio.subprocess
+import hashlib
 import os
 import shutil
 import sys
@@ -69,6 +70,15 @@ class West(Driver):
     extra_flash_args: list[str] = field(default_factory=list)
     """Additional arguments to pass to west flash (e.g., ['--openocd', '/custom/path/openocd'])"""
 
+    ci_workspace_path: str | None = None
+    """Path to the CI workspace on the exporter (optional).
+
+    This is used when the --ci flag is passed to commands. It allows using a temporary
+    workspace for CI environments, separate from the main workspace. If not specified,
+    a unique path in /tmp will be auto-generated based on the exporter configuration.
+    Example: '/tmp/jumpstarter-west-ci-abc12345'
+    """
+
     def __post_init__(self):
         if hasattr(super(), "__post_init__"):
             super().__post_init__()
@@ -77,6 +87,13 @@ class West(Driver):
         if self.zephyr_base is None:
             self.zephyr_base = os.path.join(self.workspace_path, "zephyr")
 
+        # Generate unique CI workspace path if not specified
+        if self.ci_workspace_path is None:
+            # Create a stable hash based on the workspace_path to ensure each
+            # exporter configuration gets a unique but consistent CI workspace
+            path_hash = hashlib.sha256(self.workspace_path.encode()).hexdigest()[:8]
+            self.ci_workspace_path = f"/tmp/jumpstarter-west-ci-{path_hash}"
+
         # Create workspace directory if it doesn't exist
         os.makedirs(self.workspace_path, exist_ok=True)
 
@@ -84,11 +101,30 @@ class West(Driver):
     def client(cls) -> str:
         return "jumpstarter_driver_west.client.WestClient"
 
-    def _validate_paths(self):
+    def _get_workspace_paths(self, use_ci_workspace: bool = False) -> tuple[str, str]:
+        """Get the effective workspace and zephyr_base paths
+
+        Args:
+            use_ci_workspace: If True, use ci_workspace_path instead of workspace_path
+
+        Returns:
+            Tuple of (workspace_path, zephyr_base)
+        """
+        if use_ci_workspace:
+            ws_path = self.ci_workspace_path
+            zephyr_base = os.path.join(ws_path, "zephyr")
+        else:
+            ws_path = self.workspace_path
+            zephyr_base = self.zephyr_base
+        return ws_path, zephyr_base
+
+    def _validate_paths(self, use_ci_workspace: bool = False):
         """Validate that required paths exist for flash operations"""
-        if not os.path.isdir(self.zephyr_base):
+        _, zephyr_base = self._get_workspace_paths(use_ci_workspace)
+
+        if not os.path.isdir(zephyr_base):
             raise ValueError(
-                f"Zephyr base directory does not exist: {self.zephyr_base}\n"
+                f"Zephyr base directory does not exist: {zephyr_base}\n"
                 "Run 'initialize_workspace' to set up the workspace first."
             )
 
@@ -144,7 +180,7 @@ class West(Driver):
             )
 
     @export
-    async def flash(self, src: str) -> AsyncGenerator[str, None]:
+    async def flash(self, src: str, use_ci_workspace: bool = False) -> AsyncGenerator[str, None]:
         """Flash firmware to the target board using a build directory archive
 
         Receives a tar archive of the Zephyr build directory, extracts it to a
@@ -157,11 +193,15 @@ class West(Driver):
 
         Args:
             src: Streaming resource handle for the build directory tar archive
+            use_ci_workspace: If True, use the CI workspace path instead of the configured
+                            workspace_path.
 
         Yields:
             Command output lines as they are produced.
         """
-        self._validate_paths()
+        self._validate_paths(use_ci_workspace)
+
+        _, zephyr_base = self._get_workspace_paths(use_ci_workspace)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             archive_path = os.path.join(tmpdir, "build.tar")
@@ -179,7 +219,8 @@ class West(Driver):
             cmd = [self.west_path, "flash", "--no-rebuild", "--build-dir", build_dir]
             cmd.extend(self.extra_flash_args)
 
-            async for line in self._stream_cmd(cmd, cwd=self.zephyr_base):
+            env = self._build_env(use_ci_workspace)
+            async for line in self._stream_cmd(cmd, cwd=zephyr_base, env=env):
                 yield line
 
     @export
@@ -188,6 +229,7 @@ class West(Driver):
         manifest_url: str = "https://github.com/zephyrproject-rtos/zephyr",
         manifest_rev: str | None = None,
         manifest_file: str | None = None,
+        use_ci_workspace: bool = False,
     ) -> AsyncGenerator[str, None]:
         """Initialize a Zephyr workspace using west init
 
@@ -201,28 +243,40 @@ class West(Driver):
             manifest_rev: Git revision to checkout (tag, branch, or commit hash)
                          If None, uses the default branch
             manifest_file: Manifest file to use (default: west.yml)
+            use_ci_workspace: If True, use the CI workspace path instead of the configured
+                            workspace_path. The CI workspace is cleaned before initialization.
 
         Yields:
             Command output lines as they are produced.
         """
-        west_config = os.path.join(self.workspace_path, ".west")
+        ws_path, _ = self._get_workspace_paths(use_ci_workspace)
+
+        # For CI workspace, remove it if it exists to start fresh
+        if use_ci_workspace and os.path.exists(ws_path):
+            yield f"Removing existing CI workspace at {ws_path}"
+            shutil.rmtree(ws_path)
+
+        west_config = os.path.join(ws_path, ".west")
 
         if os.path.exists(west_config):
-            yield f"Workspace already initialized at {self.workspace_path}"
+            yield f"Workspace already initialized at {ws_path}"
         else:
+            # Create workspace directory
+            os.makedirs(ws_path, exist_ok=True)
+
             cmd = [self.west_path, "init"]
             if manifest_file:
                 cmd.extend(["-m", manifest_file])
             if manifest_rev:
                 cmd.extend(["--mr", manifest_rev])
-            cmd.append(self.workspace_path)
+            cmd.append(ws_path)
 
-            yield f"Initializing workspace at {self.workspace_path}"
+            yield f"Initializing workspace at {ws_path}"
             async for line in self._stream_cmd(cmd):
                 yield line
 
         if manifest_rev and os.path.exists(west_config):
-            manifest_dir = os.path.join(self.workspace_path, "zephyr")
+            manifest_dir = os.path.join(ws_path, "zephyr")
             if os.path.exists(manifest_dir):
                 yield f"Checking out revision {manifest_rev}"
                 async for line in self._stream_cmd(
@@ -231,39 +285,45 @@ class West(Driver):
                 ):
                     yield line
 
-        async for line in self._update_workspace():
+        async for line in self._update_workspace(use_ci_workspace=use_ci_workspace):
             yield line
 
     @export
-    async def update_workspace(self) -> AsyncGenerator[str, None]:
+    async def update_workspace(self, use_ci_workspace: bool = False) -> AsyncGenerator[str, None]:
         """Update workspace dependencies using west update
 
         Fetches and updates all projects defined in the west manifest.
         This is equivalent to running 'west update' in the workspace.
 
+        Args:
+            use_ci_workspace: If True, use the CI workspace path instead of the configured
+                            workspace_path.
+
         Yields:
             Command output lines as they are produced.
         """
-        async for line in self._update_workspace():
+        async for line in self._update_workspace(use_ci_workspace=use_ci_workspace):
             yield line
 
-    async def _update_workspace(self) -> AsyncGenerator[str, None]:
+    async def _update_workspace(self, use_ci_workspace: bool = False) -> AsyncGenerator[str, None]:
         """Shared body for update_workspace / initialize_workspace post-init."""
-        west_config = os.path.join(self.workspace_path, ".west")
+        ws_path, zephyr_base = self._get_workspace_paths(use_ci_workspace)
+
+        west_config = os.path.join(ws_path, ".west")
         if not os.path.exists(west_config):
             raise ValueError(
-                f"Workspace not initialized at {self.workspace_path}. "
+                f"Workspace not initialized at {ws_path}. "
                 "Run 'initialize_workspace' first."
             )
 
         yield "Updating workspace dependencies"
         async for line in self._stream_cmd(
             [self.west_path, "update"],
-            cwd=self.workspace_path,
+            cwd=ws_path,
         ):
             yield line
 
-        req_file = os.path.join(self.zephyr_base, "scripts", "requirements.txt")
+        req_file = os.path.join(zephyr_base, "scripts", "requirements.txt")
         if os.path.isfile(req_file):
             yield f"Installing Python requirements from {req_file}"
             if shutil.which("uv"):
@@ -321,7 +381,7 @@ class West(Driver):
 
     @export
     async def twister(
-        self, src: str, test_roots: list[str]
+        self, src: str, test_roots: list[str], use_ci_workspace: bool = False
     ) -> AsyncGenerator[str, None]:
         """Run twister in test-only mode using a pre-built twister-out archive
 
@@ -337,6 +397,8 @@ class West(Driver):
         Args:
             src: Streaming resource handle for the twister-out tar archive
             test_roots: List of test root paths passed to twister via ``-T``
+            use_ci_workspace: If True, use the CI workspace path instead of the configured
+                            workspace_path.
 
         Yields:
             Command output lines as they are produced.
@@ -347,10 +409,12 @@ class West(Driver):
                 "Set hardware_map in the driver configuration."
             )
 
-        west_config = os.path.join(self.workspace_path, ".west")
+        ws_path, _ = self._get_workspace_paths(use_ci_workspace)
+
+        west_config = os.path.join(ws_path, ".west")
         if not os.path.exists(west_config):
             raise ValueError(
-                f"Workspace not initialized at {self.workspace_path}. "
+                f"Workspace not initialized at {ws_path}. "
                 "Run 'initialize_workspace' first."
             )
 
@@ -366,9 +430,9 @@ class West(Driver):
             compression = self.get_compression_from_tarfile(archive_path)
 
             with tarfile.open(archive_path, "r:*") as tar:
-                tar.extractall(self.workspace_path)
+                tar.extractall(ws_path)
 
-        twister_out = os.path.join(self.workspace_path, "twister-out")
+        twister_out = os.path.join(ws_path, "twister-out")
 
         cmd = [
             self.west_path,
@@ -385,7 +449,8 @@ class West(Driver):
         # Capture any test failures but continue to compress results
         test_error = None
         try:
-            async for line in self._stream_cmd(cmd, cwd=self.workspace_path):
+            env = self._build_env(use_ci_workspace)
+            async for line in self._stream_cmd(cmd, cwd=ws_path, env=env):
                 yield line
         except RuntimeError as e:
             test_error = e
@@ -394,7 +459,7 @@ class West(Driver):
         # Use the same compression format as the input
         compression_suffix = f".{compression}" if compression else ""
         result_archive = os.path.join(
-            self.workspace_path, f"twister-out-result.tar{compression_suffix}"
+            ws_path, f"twister-out-result.tar{compression_suffix}"
         )
         write_mode = f"w:{compression}" if compression else "w"
 
@@ -408,7 +473,7 @@ class West(Driver):
             yield "Results compressed and ready for retrieval despite test failure"
 
     @export
-    async def twister_fetch_results(self, dst: str) -> None:
+    async def twister_fetch_results(self, dst: str, use_ci_workspace: bool = False) -> None:
         """Stream the twister result archive back to the client
 
         Streams the ``twister-out-result.tar*`` archive produced by the last
@@ -417,11 +482,15 @@ class West(Driver):
 
         Args:
             dst: Streaming resource handle to write the result archive to
+            use_ci_workspace: If True, fetch results from the CI workspace path instead
+                            of the configured workspace_path.
         """
         import glob
 
+        ws_path, _ = self._get_workspace_paths(use_ci_workspace)
+
         # Find the result archive with any compression format
-        pattern = os.path.join(self.workspace_path, "twister-out-result.tar*")
+        pattern = os.path.join(ws_path, "twister-out-result.tar*")
         matches = glob.glob(pattern)
 
         if not matches:
@@ -444,14 +513,19 @@ class West(Driver):
         finally:
             os.unlink(result_archive)
 
-    def _build_env(self) -> dict[str, str]:
+    def _build_env(self, use_ci_workspace: bool = False) -> dict[str, str]:
         """Build environment variables for west commands
+
+        Args:
+            use_ci_workspace: If True, use ci_workspace_path instead of workspace_path
 
         Returns:
             Dictionary of environment variables
         """
+        _, zephyr_base = self._get_workspace_paths(use_ci_workspace)
+
         env = os.environ.copy()
-        env["ZEPHYR_BASE"] = self.zephyr_base
+        env["ZEPHYR_BASE"] = zephyr_base
         # Only set ZEPHYR_SDK_INSTALL_DIR if configured — otherwise
         # subprocess.Popen / asyncio.create_subprocess_exec choke on a None value.
         if self.sdk_path:

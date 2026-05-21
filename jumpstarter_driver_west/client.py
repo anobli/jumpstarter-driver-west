@@ -38,6 +38,7 @@ class WestClient(DriverClient):
         manifest_url: str = "https://github.com/zephyrproject-rtos/zephyr",
         manifest_rev: str | None = None,
         manifest_file: str | None = None,
+        use_ci_workspace: bool = False,
     ) -> Iterator[str]:
         """Initialize a Zephyr workspace on the exporter
 
@@ -45,6 +46,7 @@ class WestClient(DriverClient):
             manifest_url: Git repository URL for the manifest
             manifest_rev: Git revision to checkout (tag, branch, or commit)
             manifest_file: Manifest file to use (default: west.yml)
+            use_ci_workspace: If True, use the CI workspace path instead of the configured workspace_path
 
         Yields:
             Command output lines, in real time.
@@ -54,15 +56,19 @@ class WestClient(DriverClient):
             manifest_url,
             manifest_rev,
             manifest_file,
+            use_ci_workspace,
         )
 
-    def update_workspace(self) -> Iterator[str]:
+    def update_workspace(self, use_ci_workspace: bool = False) -> Iterator[str]:
         """Update workspace dependencies on the exporter
+
+        Args:
+            use_ci_workspace: If True, use the CI workspace path instead of the configured workspace_path
 
         Yields:
             Command output lines, in real time.
         """
-        return self.streamingcall("update_workspace")
+        return self.streamingcall("update_workspace", use_ci_workspace)
 
     def install_sdk(self, toolchains: list[str] | None = None) -> Iterator[str]:
         """Install Zephyr SDK on the exporter
@@ -75,12 +81,13 @@ class WestClient(DriverClient):
         """
         return self.streamingcall("install_sdk", toolchains)
 
-    def flash(self, operator: Operator, path: str) -> Iterator[str]:
+    def flash(self, operator: Operator, path: str, use_ci_workspace: bool = False) -> Iterator[str]:
         """Flash firmware using a build directory tar archive
 
         Args:
             operator: OpenDAL operator for file access
             path: Path to the build directory tar archive
+            use_ci_workspace: If True, use the CI workspace path instead of the configured workspace_path
 
         Yields:
             Command output lines, in real time.
@@ -90,9 +97,9 @@ class WestClient(DriverClient):
         # context across ``yield from`` keeps it alive until the generator is
         # exhausted.
         with OpendalAdapter(client=self, operator=operator, path=path) as handle:
-            yield from self.streamingcall("flash", handle)
+            yield from self.streamingcall("flash", handle, use_ci_workspace)
 
-    def flash_build_dir(self, build_dir: str) -> Iterator[str]:
+    def flash_build_dir(self, build_dir: str, use_ci_workspace: bool = False) -> Iterator[str]:
         """Flash firmware from a local Zephyr build directory
 
         Packs the build directory into a tar archive and streams it to the
@@ -103,6 +110,7 @@ class WestClient(DriverClient):
         Args:
             build_dir: Local path to the Zephyr build directory
                        (e.g., the directory created by ``west build``)
+            use_ci_workspace: If True, use the CI workspace path instead of the configured workspace_path
 
         Yields:
             Command output lines, in real time.
@@ -115,10 +123,11 @@ class WestClient(DriverClient):
             yield from self.flash(
                 operator=Operator("fs", root="/"),
                 path=str(absolute),
+                use_ci_workspace=use_ci_workspace,
             )
 
     def twister(
-        self, operator: Operator, path: str, test_roots: list[str]
+        self, operator: Operator, path: str, test_roots: list[str], use_ci_workspace: bool = False
     ) -> Iterator[str]:
         """Run twister in test-only mode using a pre-built twister-out archive
 
@@ -133,14 +142,15 @@ class WestClient(DriverClient):
             operator: OpenDAL operator for file access
             path: Path to the twister-out tar archive (any compression format)
             test_roots: List of test root paths passed to twister via ``-T``
+            use_ci_workspace: If True, use the CI workspace path instead of the configured workspace_path
 
         Yields:
             Command output lines, in real time.
         """
         with OpendalAdapter(client=self, operator=operator, path=path) as handle:
-            yield from self.streamingcall("twister", handle, test_roots)
+            yield from self.streamingcall("twister", handle, test_roots, use_ci_workspace)
 
-    def twister_fetch_results(self, operator: Operator, path: str) -> None:
+    def twister_fetch_results(self, operator: Operator, path: str, use_ci_workspace: bool = False) -> None:
         """Fetch the twister result archive from the exporter
 
         Downloads the twister result archive produced by the last ``twister``
@@ -150,11 +160,12 @@ class WestClient(DriverClient):
         Args:
             operator: OpenDAL operator for file access
             path: Local path where the result archive will be written
+            use_ci_workspace: If True, fetch results from the CI workspace path instead of the configured workspace_path
         """
         with OpendalAdapter(client=self, operator=operator, path=path, mode="wb") as handle:
-            self.call("twister_fetch_results", handle)
+            self.call("twister_fetch_results", handle, use_ci_workspace)
 
-    def run_twister(self, archive_path: str, test_roots: list[str]) -> Iterator[str]:
+    def run_twister(self, archive_path: str, test_roots: list[str], use_ci_workspace: bool = False) -> Iterator[str]:
         """Run twister and retrieve results, overwriting the local archive
 
         Streams the archive to the exporter, runs twister yielding output lines
@@ -164,6 +175,7 @@ class WestClient(DriverClient):
         Args:
             archive_path: Local path to the twister-out tar archive (any compression format)
             test_roots: List of test root paths passed to twister via ``-T``
+            use_ci_workspace: If True, use the CI workspace path instead of the configured workspace_path
 
         Yields:
             Command output lines, in real time. After the generator is
@@ -177,12 +189,14 @@ class WestClient(DriverClient):
             operator=Operator("fs", root="/"),
             path=str(absolute),
             test_roots=test_roots,
+            use_ci_workspace=use_ci_workspace,
         )
 
         try:
             self.twister_fetch_results(
                 operator=Operator("fs", root="/"),
                 path=str(tmp_path),
+                use_ci_workspace=use_ci_workspace,
             )
             tmp_path.replace(absolute)
         except Exception:
@@ -210,20 +224,31 @@ class WestClient(DriverClient):
             "--manifest-file",
             help="Manifest file to use (default: west.yml)",
         )
-        def initialize_workspace(manifest_url, manifest_rev, manifest_file):
+        @click.option(
+            "--ci",
+            is_flag=True,
+            help="Use CI workspace (temporary, cleaned before initialization)",
+        )
+        def initialize_workspace(manifest_url, manifest_rev, manifest_file, ci):
             """Initialize a Zephyr workspace on the exporter"""
             _stream_to_stdout(
                 self.initialize_workspace(
                     manifest_url=manifest_url,
                     manifest_rev=manifest_rev,
                     manifest_file=manifest_file,
+                    use_ci_workspace=ci,
                 )
             )
 
         @base.command()
-        def update_workspace():
+        @click.option(
+            "--ci",
+            is_flag=True,
+            help="Use CI workspace instead of configured workspace",
+        )
+        def update_workspace(ci):
             """Update workspace dependencies on the exporter"""
-            _stream_to_stdout(self.update_workspace())
+            _stream_to_stdout(self.update_workspace(use_ci_workspace=ci))
 
         @base.command()
         @click.option(
@@ -237,13 +262,18 @@ class WestClient(DriverClient):
 
         @base.command()
         @click.argument("build_dir", type=click.Path(exists=True, file_okay=False, dir_okay=True))
-        def flash(build_dir):
+        @click.option(
+            "--ci",
+            is_flag=True,
+            help="Use CI workspace instead of configured workspace",
+        )
+        def flash(build_dir, ci):
             """Flash firmware from a Zephyr build directory
 
             The runner is configured on the exporter via the driver configuration.
             """
             self.logger.info("Flashing from build directory %s...", build_dir)
-            _stream_to_stdout(self.flash_build_dir(build_dir))
+            _stream_to_stdout(self.flash_build_dir(build_dir, use_ci_workspace=ci))
 
         @base.command()
         @click.argument("archive", type=click.Path(exists=True, file_okay=True, dir_okay=False))
@@ -255,7 +285,12 @@ class WestClient(DriverClient):
             required=True,
             help="Test root path (can be specified multiple times)",
         )
-        def twister(archive, test_roots):
+        @click.option(
+            "--ci",
+            is_flag=True,
+            help="Use CI workspace instead of configured workspace",
+        )
+        def twister(archive, test_roots, ci):
             """Run twister tests on the exporter using a pre-built archive
 
             ARCHIVE is the path to the twister-out tar archive produced by the build server.
@@ -265,7 +300,7 @@ class WestClient(DriverClient):
             The hardware map is configured on the exporter via the driver configuration.
             """
             self.logger.info("Running twister from archive %s...", archive)
-            _stream_to_stdout(self.run_twister(archive, list(test_roots)))
+            _stream_to_stdout(self.run_twister(archive, list(test_roots), use_ci_workspace=ci))
 
         return base
 
