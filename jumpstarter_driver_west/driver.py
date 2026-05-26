@@ -26,26 +26,21 @@ class West(Driver):
     to interact with hardware on a remote exporter. You can flash firmware, debug, and run
     tests on boards located elsewhere while using familiar Zephyr workflows.
 
-    The driver manages the Zephyr workspace on the exporter side, allowing you to:
-    - Initialize and update Zephyr workspaces
+    The driver manages multiple Zephyr workspaces on the exporter side, allowing you to:
+    - Initialize and update Zephyr workspaces for different versions/branches
     - Install the Zephyr SDK
     - Flash firmware to remote boards
     - Run twister tests on remote hardware
+    - Isolate workspaces by client/user to prevent conflicts
     """
 
-    workspace_path: str
-    """Path to the West workspace on the exporter (required).
+    workspace_base: str
+    """Base directory for all West workspaces on the exporter (required).
 
-    This is where west will manage the Zephyr projects. You can have multiple workspaces
-    to avoid conflicts between different versions or configurations.
-    Example: '/home/exporter/zephyr-workspace'
-    """
-
-    zephyr_base: str | None = None
-    """Path to the Zephyr source tree on the exporter (optional).
-
-    If not specified, defaults to {workspace_path}/zephyr.
-    Only needs to be set if you have a custom Zephyr location.
+    Individual workspaces are created as subdirectories based on manifest URL,
+    revision, and optional client ID. Each workspace is isolated with its own
+    Python virtual environment.
+    Example: '/home/exporter/jumpstarter-workspaces'
     """
 
     sdk_path: str | None = None
@@ -70,68 +65,127 @@ class West(Driver):
     extra_flash_args: list[str] = field(default_factory=list)
     """Additional arguments to pass to west flash (e.g., ['--openocd', '/custom/path/openocd'])"""
 
-    ci_workspace_path: str | None = None
-    """Path to the CI workspace on the exporter (optional).
-
-    This is used when the --ci flag is passed to commands. It allows using a temporary
-    workspace for CI environments, separate from the main workspace. If not specified,
-    a unique path in /tmp will be auto-generated based on the exporter configuration.
-    Example: '/tmp/jumpstarter-west-ci-abc12345'
-    """
-
     def __post_init__(self):
         if hasattr(super(), "__post_init__"):
             super().__post_init__()
 
-        # Auto-detect zephyr_base if not specified
-        if self.zephyr_base is None:
-            self.zephyr_base = os.path.join(self.workspace_path, "zephyr")
-
-        # Generate unique CI workspace path if not specified
-        if self.ci_workspace_path is None:
-            # Create a stable hash based on the workspace_path to ensure each
-            # exporter configuration gets a unique but consistent CI workspace
-            path_hash = hashlib.sha256(self.workspace_path.encode()).hexdigest()[:8]
-            self.ci_workspace_path = f"/tmp/jumpstarter-west-ci-{path_hash}"
-
-        # Create workspace directory if it doesn't exist
-        os.makedirs(self.workspace_path, exist_ok=True)
+        # Create workspace base directory if it doesn't exist
+        os.makedirs(self.workspace_base, exist_ok=True)
 
     @classmethod
     def client(cls) -> str:
         return "jumpstarter_driver_west.client.WestClient"
 
-    def _get_workspace_paths(self, use_ci_workspace: bool = False) -> tuple[str, str]:
-        """Get the effective workspace and zephyr_base paths
+    def _get_workspace_path(
+        self, manifest_url: str, manifest_rev: str, client_id: str | None, zephyr_path: str = "zephyr"
+    ) -> tuple[str, str]:
+        """Get workspace and zephyr paths from manifest parameters
+
+        Generates a unique workspace identifier from the manifest parameters
+        and returns the full paths to the workspace directory and zephyr source.
 
         Args:
-            use_ci_workspace: If True, use ci_workspace_path instead of workspace_path
+            manifest_url: Git repository URL for the manifest
+            manifest_rev: Git revision (tag, branch, commit hash)
+            client_id: Optional client identifier to prevent conflicts
+            zephyr_path: Relative path to Zephyr within the workspace (default: "zephyr")
 
         Returns:
             Tuple of (workspace_path, zephyr_base)
+
+        Example:
+            >>> ws_path, zephyr_base = self._get_workspace_path(
+            ...     "https://github.com/zephyrproject-rtos/zephyr",
+            ...     "v3.5.0",
+            ...     "dev-alice",
+            ...     "zephyr"
+            ... )
+            >>> # ws_path = "/home/exporter/jumpstarter-workspaces/zephyr_v3.5.0_dev-alice"
+            >>> # zephyr_base = "/home/exporter/jumpstarter-workspaces/zephyr_v3.5.0_dev-alice/zephyr"
         """
-        if use_ci_workspace:
-            ws_path = self.ci_workspace_path
-            zephyr_base = os.path.join(ws_path, "zephyr")
-        else:
-            ws_path = self.workspace_path
-            zephyr_base = self.zephyr_base
-        return ws_path, zephyr_base
+        from .utils import generate_workspace_id
 
-    def _validate_paths(self, use_ci_workspace: bool = False):
-        """Validate that required paths exist for flash operations"""
-        _, zephyr_base = self._get_workspace_paths(use_ci_workspace)
+        workspace_id = generate_workspace_id(manifest_url, manifest_rev, client_id)
+        workspace_path = os.path.join(self.workspace_base, workspace_id)
+        zephyr_base = os.path.join(workspace_path, zephyr_path)
+        return workspace_path, zephyr_base
 
-        if not os.path.isdir(zephyr_base):
+    def _validate_workspace(self, workspace_path: str):
+        """Validate that workspace has been initialized
+
+        Args:
+            workspace_path: Path to the workspace directory
+
+        Raises:
+            ValueError: If workspace doesn't exist or isn't initialized
+        """
+        west_config = os.path.join(workspace_path, ".west")
+        if not os.path.exists(west_config):
             raise ValueError(
-                f"Zephyr base directory does not exist: {zephyr_base}\n"
-                "Run 'initialize_workspace' to set up the workspace first."
+                f"Workspace not initialized at {workspace_path}. "
+                "Run 'initialize_workspace' with the same manifest parameters first."
             )
 
         if self.sdk_path and not os.path.isdir(self.sdk_path):
             raise ValueError(
-                f"Zephyr SDK directory does not exist: {self.sdk_path}\nRun 'install_sdk' to install the Zephyr SDK."
+                f"Zephyr SDK directory does not exist: {self.sdk_path}\n"
+                "Run 'install_sdk' to install the Zephyr SDK."
             )
+
+    def _get_venv_path(self, workspace_path: str) -> str:
+        """Get path to the Python virtual environment for a workspace
+
+        Args:
+            workspace_path: Path to the workspace directory
+
+        Returns:
+            Path to the venv directory
+        """
+        return os.path.join(workspace_path, ".venv")
+
+    async def _ensure_venv(self, workspace_path: str) -> AsyncGenerator[str, None]:
+        """Ensure Python virtual environment exists for workspace
+
+        Creates a new venv if it doesn't exist, with pip installed and upgraded.
+        This is idempotent - safe to call multiple times.
+
+        Args:
+            workspace_path: Path to the workspace directory
+
+        Yields:
+            Status messages during venv creation
+
+        Note:
+            After all messages are yielded, the venv bin path is available at
+            `os.path.join(workspace_path, ".venv", "bin")`
+
+        Example:
+            >>> async for line in self._ensure_venv("/path/to/workspace"):
+            ...     print(line)
+        """
+        import venv
+
+        venv_path = self._get_venv_path(workspace_path)
+
+        if not os.path.exists(venv_path):
+            yield f"Creating Python virtual environment at {venv_path}"
+            # Create venv with pip
+            venv.create(venv_path, with_pip=True, symlinks=True)
+
+            # Upgrade pip to latest version
+            pip_path = os.path.join(venv_path, "bin", "pip")
+            yield "Upgrading pip..."
+            async for line in self._stream_cmd([pip_path, "install", "--upgrade", "pip"]):
+                yield line
+
+            # Install west into the venv so every subsequent `west ...` call (update,
+            # twister, flash, sdk install) resolves to the venv's west — whose shebang
+            # points to this venv's python. Without this, PATH falls back to a system
+            # west whose sys.executable is some other venv, and twister ends up spawning
+            # pytest under a Python that doesn't have the workspace's installed deps.
+            yield "Installing west into venv..."
+            async for line in self._stream_cmd([pip_path, "install", "west"]):
+                yield line
 
     async def _stream_cmd(
         self,
@@ -147,13 +201,22 @@ class West(Driver):
         like twister — keeps the gRPC stream active so HTTP/2 keepalive pings
         don't trip ``UNAVAILABLE: ping timeout``.
 
-        Raises RuntimeError if the process exits non-zero; the message includes
-        the tail of the output for context.
+        Args:
+            cmd: Command and arguments to execute
+            cwd: Working directory for the command
+            env: Environment variables (must be provided with venv activated)
+
+        Raises:
+            RuntimeError: If the process exits with non-zero status
+
+        Yields:
+            Output lines from the command
         """
         if env is None:
-            env = self._build_env()
+            env = os.environ.copy()
 
         self.logger.debug("Running command: %s", " ".join(cmd))
+        print("Running command: %s", " ".join(cmd))
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -180,7 +243,14 @@ class West(Driver):
             )
 
     @export
-    async def flash(self, src: str, use_ci_workspace: bool = False) -> AsyncGenerator[str, None]:
+    async def flash(
+        self,
+        src: str,
+        manifest_url: str,
+        manifest_rev: str,
+        client_id: str | None = None,
+        zephyr_path: str = "zephyr",
+    ) -> AsyncGenerator[str, None]:
         """Flash firmware to the target board using a build directory archive
 
         Receives a tar archive of the Zephyr build directory, extracts it to a
@@ -193,15 +263,21 @@ class West(Driver):
 
         Args:
             src: Streaming resource handle for the build directory tar archive
-            use_ci_workspace: If True, use the CI workspace path instead of the configured
-                            workspace_path.
+            manifest_url: Git repository URL for the manifest
+            manifest_rev: Git revision (tag, branch, or commit hash)
+            client_id: Optional client identifier to identify the workspace
+            zephyr_path: Relative path to Zephyr within the workspace (default: "zephyr")
 
         Yields:
             Command output lines as they are produced.
         """
-        self._validate_paths(use_ci_workspace)
+        # Get workspace paths
+        workspace_path, zephyr_base = self._get_workspace_path(manifest_url, manifest_rev, client_id, zephyr_path)
 
-        _, zephyr_base = self._get_workspace_paths(use_ci_workspace)
+        # Validate workspace exists
+        self._validate_workspace(workspace_path)
+
+        venv_bin = os.path.join(workspace_path, ".venv", "bin")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             archive_path = os.path.join(tmpdir, "build.tar")
@@ -219,7 +295,7 @@ class West(Driver):
             cmd = [self.west_path, "flash", "--no-rebuild", "--build-dir", build_dir]
             cmd.extend(self.extra_flash_args)
 
-            env = self._build_env(use_ci_workspace)
+            env = self._build_env(workspace_path, venv_bin, zephyr_base)
             async for line in self._stream_cmd(cmd, cwd=zephyr_base, env=env):
                 yield line
 
@@ -229,113 +305,228 @@ class West(Driver):
         manifest_url: str = "https://github.com/zephyrproject-rtos/zephyr",
         manifest_rev: str | None = None,
         manifest_file: str | None = None,
-        use_ci_workspace: bool = False,
+        client_id: str | None = None,
+        force_recreate: bool = False,
+        zephyr_path: str = "zephyr",
+        post_init_command: str | None = None,
     ) -> AsyncGenerator[str, None]:
         """Initialize a Zephyr workspace using west init
 
         Sets up a new Zephyr workspace on the exporter. This command:
-        1. Runs 'west init' if the workspace doesn't exist
-        2. Checks out a specific version if manifest_rev is provided
-        3. Runs 'west update' to fetch all dependencies
+        1. Generates a unique workspace identifier from manifest parameters
+        2. Optionally deletes existing workspace if force_recreate=True
+        3. Runs 'west init' if the workspace doesn't exist
+        4. Creates a Python virtual environment for the workspace
+        5. Checks out a specific version if manifest_rev is provided
+        6. Runs 'west update' to fetch all dependencies
+        7. Optionally runs a user-defined shell command (post_init_command)
 
         Args:
             manifest_url: Git repository URL for the manifest (default: Zephyr main repo)
             manifest_rev: Git revision to checkout (tag, branch, or commit hash)
-                         If None, uses the default branch
+                         If None, uses "main"
             manifest_file: Manifest file to use (default: west.yml)
-            use_ci_workspace: If True, use the CI workspace path instead of the configured
-                            workspace_path. The CI workspace is cleaned before initialization.
+            client_id: Optional client identifier to isolate workspaces between users/CI
+            force_recreate: If True, delete and recreate the workspace from scratch
+            zephyr_path: Relative path to Zephyr within the workspace (default: "zephyr")
+            post_init_command: Shell command to run after west update completes. Runs via
+                              `bash -c` with cwd=workspace_path and the venv activated.
+                              Example: "pip install -r external-module/openthread-tests.git/requirements.txt"
 
         Yields:
             Command output lines as they are produced.
+
+        Example:
+            # Developer workflow (reuse workspace)
+            >>> async for line in driver.initialize_workspace(
+            ...     manifest_url="https://github.com/zephyrproject-rtos/zephyr",
+            ...     manifest_rev="v3.5.0",
+            ...     client_id="dev-alice"
+            ... ):
+            ...     print(line)
+
+            # CI workflow (always fresh workspace)
+            >>> async for line in driver.initialize_workspace(
+            ...     manifest_url="https://github.com/zephyrproject-rtos/zephyr",
+            ...     manifest_rev="v3.5.0",
+            ...     client_id="ci",
+            ...     force_recreate=True
+            ... ):
+            ...     print(line)
         """
-        ws_path, _ = self._get_workspace_paths(use_ci_workspace)
+        # Use "main" as default revision if not specified
+        if manifest_rev is None:
+            manifest_rev = "main"
 
-        # For CI workspace, remove it if it exists to start fresh
-        if use_ci_workspace and os.path.exists(ws_path):
-            yield f"Removing existing CI workspace at {ws_path}"
-            shutil.rmtree(ws_path)
+        # Get workspace paths from manifest parameters
+        workspace_path, zephyr_base = self._get_workspace_path(manifest_url, manifest_rev, client_id, zephyr_path)
 
-        west_config = os.path.join(ws_path, ".west")
+        yield f"Workspace: {workspace_path}"
 
+        # Force recreate: delete entire workspace directory
+        if force_recreate and os.path.exists(workspace_path):
+            yield f"Force recreate: removing existing workspace at {workspace_path}"
+            shutil.rmtree(workspace_path)
+
+        # Create workspace directory
+        os.makedirs(workspace_path, exist_ok=True)
+
+        # Ensure the Python venv exists FIRST so every west invocation below uses
+        # the venv's `west` (and therefore the venv's Python as sys.executable).
+        async for line in self._ensure_venv(workspace_path):
+            yield line
+
+        venv_bin = os.path.join(workspace_path, ".venv", "bin")
+        west_config = os.path.join(workspace_path, ".west")
+
+        # Initialize west if not already done
         if os.path.exists(west_config):
-            yield f"Workspace already initialized at {ws_path}"
+            yield f"Workspace already initialized at {workspace_path}"
         else:
-            # Create workspace directory
-            os.makedirs(ws_path, exist_ok=True)
-
             cmd = [self.west_path, "init"]
             if manifest_file:
-                cmd.extend(["-m", manifest_file])
-            if manifest_rev:
-                cmd.extend(["--mr", manifest_rev])
-            cmd.append(ws_path)
+                cmd.extend(["-mf", manifest_file])
+            cmd.extend(["--mr", manifest_rev])
+            cmd.extend(["-m", manifest_url])
+            cmd.append(workspace_path)
 
-            yield f"Initializing workspace at {ws_path}"
-            async for line in self._stream_cmd(cmd):
+            yield f"Initializing west workspace at {workspace_path}"
+            env = self._build_env(workspace_path, venv_bin, zephyr_base)
+            async for line in self._stream_cmd(cmd, cwd=workspace_path, env=env):
                 yield line
 
-        if manifest_rev and os.path.exists(west_config):
-            manifest_dir = os.path.join(ws_path, "zephyr")
-            if os.path.exists(manifest_dir):
+        # Checkout specific revision if workspace was already initialized
+        if manifest_rev and os.path.exists(west_config) and not force_recreate:
+            if os.path.exists(zephyr_base):
                 yield f"Checking out revision {manifest_rev}"
+                env = self._build_env(workspace_path, venv_bin, zephyr_base)
                 async for line in self._stream_cmd(
                     ["git", "checkout", manifest_rev],
-                    cwd=manifest_dir,
+                    cwd=zephyr_base,
+                    env=env,
                 ):
                     yield line
 
-        async for line in self._update_workspace(use_ci_workspace=use_ci_workspace):
+        # Run west update to fetch all dependencies
+        yield "Running west update..."
+        async for line in self._update_workspace_impl(workspace_path, venv_bin, zephyr_base):
             yield line
 
+        # Run user-defined post-init shell command if provided
+        if post_init_command:
+            yield f"Running post-init command: {post_init_command}"
+            env = self._build_env(workspace_path, venv_bin, zephyr_base)
+            async for line in self._stream_cmd(
+                ["bash", "-c", post_init_command],
+                cwd=workspace_path,
+                env=env,
+            ):
+                yield line
+
+        yield f"Workspace initialization complete: {workspace_path}"
+
     @export
-    async def update_workspace(self, use_ci_workspace: bool = False) -> AsyncGenerator[str, None]:
+    async def update_workspace(
+        self,
+        manifest_url: str = "https://github.com/zephyrproject-rtos/zephyr",
+        manifest_rev: str | None = None,
+        client_id: str | None = None,
+        zephyr_path: str = "zephyr",
+    ) -> AsyncGenerator[str, None]:
         """Update workspace dependencies using west update
 
         Fetches and updates all projects defined in the west manifest.
         This is equivalent to running 'west update' in the workspace.
 
         Args:
-            use_ci_workspace: If True, use the CI workspace path instead of the configured
-                            workspace_path.
+            manifest_url: Git repository URL for the manifest
+            manifest_rev: Git revision (tag, branch, or commit hash). If None, uses "main"
+            client_id: Optional client identifier to identify the workspace
+            zephyr_path: Relative path to Zephyr within the workspace (default: "zephyr")
 
         Yields:
             Command output lines as they are produced.
         """
-        async for line in self._update_workspace(use_ci_workspace=use_ci_workspace):
+        # Use "main" as default revision if not specified
+        if manifest_rev is None:
+            manifest_rev = "main"
+
+        # Get workspace paths
+        workspace_path, zephyr_base = self._get_workspace_path(manifest_url, manifest_rev, client_id, zephyr_path)
+
+        # Validate workspace exists
+        self._validate_workspace(workspace_path)
+
+        venv_bin = os.path.join(workspace_path, ".venv", "bin")
+
+        # Run update
+        async for line in self._update_workspace_impl(workspace_path, venv_bin, zephyr_base):
             yield line
 
-    async def _update_workspace(self, use_ci_workspace: bool = False) -> AsyncGenerator[str, None]:
-        """Shared body for update_workspace / initialize_workspace post-init."""
-        ws_path, zephyr_base = self._get_workspace_paths(use_ci_workspace)
+    async def _update_workspace_impl(
+        self, workspace_path: str, venv_bin: str, zephyr_base: str
+    ) -> AsyncGenerator[str, None]:
+        """Shared implementation for updating workspace dependencies
 
-        west_config = os.path.join(ws_path, ".west")
+        Args:
+            workspace_path: Path to the workspace directory
+            venv_bin: Path to the venv bin directory
+            zephyr_base: Path to the Zephyr directory
+        """
+        west_config = os.path.join(workspace_path, ".west")
         if not os.path.exists(west_config):
             raise ValueError(
-                f"Workspace not initialized at {ws_path}. "
+                f"Workspace not initialized at {workspace_path}. "
                 "Run 'initialize_workspace' first."
             )
+
+        # Build environment with venv
+        env = self._build_env(workspace_path, venv_bin, zephyr_base)
 
         yield "Updating workspace dependencies"
         async for line in self._stream_cmd(
             [self.west_path, "update"],
-            cwd=ws_path,
+            cwd=workspace_path,
+            env=env,
         ):
             yield line
 
+        # Install Python requirements using venv pip. Fail loudly if the expected
+        # requirements file is missing — that almost always means zephyr_path was
+        # wrong (e.g., Zephyr lives under "third-party/zephyr" but caller used the
+        # default "zephyr"). Silently skipping leaves the venv missing jsonschema /
+        # pyelftools etc. and the failure only surfaces much later inside twister.
         req_file = os.path.join(zephyr_base, "scripts", "requirements.txt")
-        if os.path.isfile(req_file):
-            yield f"Installing Python requirements from {req_file}"
-            if shutil.which("uv"):
-                pip_cmd = ["uv", "pip", "install", "-r", req_file]
-            else:
-                pip_cmd = [sys.executable, "-m", "pip", "install", "-r", req_file]
-            async for line in self._stream_cmd(pip_cmd):
-                yield line
+        if not os.path.isfile(req_file):
+            raise ValueError(
+                f"Zephyr requirements file not found at {req_file}. "
+                f"Check that zephyr_path correctly points to the Zephyr source "
+                f"directory inside the workspace (e.g., pass --zephyr-path "
+                f"third-party/zephyr if Zephyr is fetched there)."
+            )
+
+        yield f"Installing Python requirements from {req_file}"
+
+        # Check for uv in venv first, then use pip
+        uv_path = os.path.join(venv_bin, "uv")
+        pip_path = os.path.join(venv_bin, "pip")
+
+        if os.path.exists(uv_path):
+            pip_cmd = [uv_path, "pip", "install", "-r", req_file]
+        else:
+            pip_cmd = [pip_path, "install", "-r", req_file]
+
+        async for line in self._stream_cmd(pip_cmd, env=env):
+            yield line
 
     @export
     async def install_sdk(
-        self, toolchains: list[str] | None = None
+        self,
+        toolchains: list[str] | None = None,
+        manifest_url: str = "https://github.com/zephyrproject-rtos/zephyr",
+        manifest_rev: str | None = None,
+        client_id: str | None = None,
+        zephyr_path: str = "zephyr",
     ) -> AsyncGenerator[str, None]:
         """Install Zephyr SDK using west sdk install
 
@@ -345,6 +536,10 @@ class West(Driver):
         Args:
             toolchains: List of specific toolchains to install (e.g., ['arm', 'riscv'])
                        If None, installs all available toolchains
+            manifest_url: Git repository URL for the manifest (default: Zephyr main repo)
+            manifest_rev: Git revision (tag, branch, or commit hash). If None, uses "main"
+            client_id: Optional client identifier to identify the workspace
+            zephyr_path: Relative path to Zephyr within the workspace (default: "zephyr")
 
         Yields:
             Command output lines as they are produced.
@@ -355,17 +550,29 @@ class West(Driver):
                 "Set sdk_path in the driver configuration."
             )
 
+        # Use "main" as default revision if not specified
+        if manifest_rev is None:
+            manifest_rev = "main"
+
+        # Get workspace paths
+        workspace_path, zephyr_base = self._get_workspace_path(manifest_url, manifest_rev, client_id, zephyr_path)
+
+        # Validate workspace exists
+        self._validate_workspace(workspace_path)
+
+        venv_bin = os.path.join(workspace_path, ".venv", "bin")
+
         os.makedirs(self.sdk_path, exist_ok=True)
 
         cmd = [self.west_path, "sdk", "install"]
         if toolchains:
             cmd.extend(["-t", ",".join(toolchains)])
 
-        env = self._build_env()
+        env = self._build_env(workspace_path, venv_bin, zephyr_base)
         env["ZEPHYR_SDK_INSTALL_DIR"] = self.sdk_path
 
         yield f"Installing Zephyr SDK to {self.sdk_path}"
-        async for line in self._stream_cmd(cmd, cwd=self.workspace_path, env=env):
+        async for line in self._stream_cmd(cmd, cwd=workspace_path, env=env):
             yield line
 
 
@@ -381,7 +588,14 @@ class West(Driver):
 
     @export
     async def twister(
-        self, src: str, test_roots: list[str], use_ci_workspace: bool = False
+        self,
+        src: str,
+        test_roots: list[str],
+        manifest_url: str,
+        manifest_rev: str,
+        client_id: str | None = None,
+        zephyr_path: str = "zephyr",
+        extra_twister_args: list[str] | None = None,
     ) -> AsyncGenerator[str, None]:
         """Run twister in test-only mode using a pre-built twister-out archive
 
@@ -397,8 +611,11 @@ class West(Driver):
         Args:
             src: Streaming resource handle for the twister-out tar archive
             test_roots: List of test root paths passed to twister via ``-T``
-            use_ci_workspace: If True, use the CI workspace path instead of the configured
-                            workspace_path.
+            manifest_url: Git repository URL for the manifest
+            manifest_rev: Git revision (tag, branch, or commit hash)
+            client_id: Optional client identifier to identify the workspace
+            zephyr_path: Relative path to Zephyr within the workspace (default: "zephyr")
+            extra_twister_args: Additional arguments to pass to twister (e.g., ['--pytest-args=-v', '--log-level=DEBUG'])
 
         Yields:
             Command output lines as they are produced.
@@ -409,14 +626,13 @@ class West(Driver):
                 "Set hardware_map in the driver configuration."
             )
 
-        ws_path, _ = self._get_workspace_paths(use_ci_workspace)
+        # Get workspace paths
+        workspace_path, zephyr_base = self._get_workspace_path(manifest_url, manifest_rev, client_id, zephyr_path)
 
-        west_config = os.path.join(ws_path, ".west")
-        if not os.path.exists(west_config):
-            raise ValueError(
-                f"Workspace not initialized at {ws_path}. "
-                "Run 'initialize_workspace' first."
-            )
+        # Validate workspace exists
+        self._validate_workspace(workspace_path)
+
+        venv_bin = os.path.join(workspace_path, ".venv", "bin")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             archive_path = os.path.join(tmpdir, "twister-out.tar")
@@ -430,9 +646,9 @@ class West(Driver):
             compression = self.get_compression_from_tarfile(archive_path)
 
             with tarfile.open(archive_path, "r:*") as tar:
-                tar.extractall(ws_path)
+                tar.extractall(workspace_path)
 
-        twister_out = os.path.join(ws_path, "twister-out")
+        twister_out = os.path.join(workspace_path, "twister-out")
 
         cmd = [
             self.west_path,
@@ -443,14 +659,16 @@ class West(Driver):
         ]
         for root in test_roots:
             cmd.extend(["-T", root])
+        if extra_twister_args:
+            cmd.extend(extra_twister_args)
 
         yield f"Running twister with hardware map {self.hardware_map}"
 
         # Capture any test failures but continue to compress results
         test_error = None
         try:
-            env = self._build_env(use_ci_workspace)
-            async for line in self._stream_cmd(cmd, cwd=ws_path, env=env):
+            env = self._build_env(workspace_path, venv_bin, zephyr_base)
+            async for line in self._stream_cmd(cmd, cwd=workspace_path, env=env):
                 yield line
         except RuntimeError as e:
             test_error = e
@@ -459,7 +677,7 @@ class West(Driver):
         # Use the same compression format as the input
         compression_suffix = f".{compression}" if compression else ""
         result_archive = os.path.join(
-            ws_path, f"twister-out-result.tar{compression_suffix}"
+            workspace_path, f"twister-out-result.tar{compression_suffix}"
         )
         write_mode = f"w:{compression}" if compression else "w"
 
@@ -473,7 +691,14 @@ class West(Driver):
             yield "Results compressed and ready for retrieval despite test failure"
 
     @export
-    async def twister_fetch_results(self, dst: str, use_ci_workspace: bool = False) -> None:
+    async def twister_fetch_results(
+        self,
+        dst: str,
+        manifest_url: str,
+        manifest_rev: str,
+        client_id: str | None = None,
+        zephyr_path: str = "zephyr",
+    ) -> None:
         """Stream the twister result archive back to the client
 
         Streams the ``twister-out-result.tar*`` archive produced by the last
@@ -482,15 +707,18 @@ class West(Driver):
 
         Args:
             dst: Streaming resource handle to write the result archive to
-            use_ci_workspace: If True, fetch results from the CI workspace path instead
-                            of the configured workspace_path.
+            manifest_url: Git repository URL for the manifest
+            manifest_rev: Git revision (tag, branch, or commit hash)
+            client_id: Optional client identifier to identify the workspace
+            zephyr_path: Relative path to Zephyr within the workspace (default: "zephyr")
         """
         import glob
 
-        ws_path, _ = self._get_workspace_paths(use_ci_workspace)
+        # Get workspace paths
+        workspace_path, _ = self._get_workspace_path(manifest_url, manifest_rev, client_id, zephyr_path)
 
         # Find the result archive with any compression format
-        pattern = os.path.join(ws_path, "twister-out-result.tar*")
+        pattern = os.path.join(workspace_path, "twister-out-result.tar*")
         matches = glob.glob(pattern)
 
         if not matches:
@@ -513,21 +741,28 @@ class West(Driver):
         finally:
             os.unlink(result_archive)
 
-    def _build_env(self, use_ci_workspace: bool = False) -> dict[str, str]:
-        """Build environment variables for west commands
+    def _build_env(self, workspace_path: str, venv_bin: str, zephyr_base: str) -> dict[str, str]:
+        """Build environment variables for west commands with venv activated
 
         Args:
-            use_ci_workspace: If True, use ci_workspace_path instead of workspace_path
+            workspace_path: Path to the workspace directory
+            venv_bin: Path to the venv bin directory
+            zephyr_base: Path to the Zephyr directory
 
         Returns:
-            Dictionary of environment variables
+            Dictionary of environment variables with venv activated
         """
-        _, zephyr_base = self._get_workspace_paths(use_ci_workspace)
-
         env = os.environ.copy()
+
+        # Set ZEPHYR_BASE to the provided zephyr path
         env["ZEPHYR_BASE"] = zephyr_base
-        # Only set ZEPHYR_SDK_INSTALL_DIR if configured — otherwise
-        # subprocess.Popen / asyncio.create_subprocess_exec choke on a None value.
+
+        # Activate venv by prepending to PATH and setting VIRTUAL_ENV
+        env["PATH"] = f"{venv_bin}:{env.get('PATH', '')}"
+        env["VIRTUAL_ENV"] = os.path.dirname(venv_bin)
+
+        # Set SDK path if configured
         if self.sdk_path:
             env["ZEPHYR_SDK_INSTALL_DIR"] = self.sdk_path
+
         return env
