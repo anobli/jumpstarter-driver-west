@@ -128,6 +128,7 @@ class WestClient(DriverClient):
         force_recreate: bool = False,
         zephyr_path: str | None = None,
         post_init_command: str | None = None,
+        url: str | None = None,
     ) -> Iterator[str]:
         """Initialize a Zephyr workspace on the exporter
 
@@ -143,6 +144,8 @@ class WestClient(DriverClient):
             zephyr_path: Relative path to Zephyr within workspace (from config if None, default: "zephyr")
             post_init_command: Shell command to run after init completes (from config if None).
                               Runs via `bash -c` with cwd=workspace_path and the venv activated.
+            url: URL to fetch a pre-built workspace archive (tar, tar.gz, tar.bz2, or tar.xz).
+                When provided, the workspace is fetched from this URL instead of running west init/update.
 
         Yields:
             Command output lines, in real time.
@@ -181,6 +184,7 @@ class WestClient(DriverClient):
             force_recreate,
             zephyr_path,
             post_init_command,
+            url,
         )
 
     def update_workspace(
@@ -538,7 +542,11 @@ class WestClient(DriverClient):
                 "Example: 'pip install -r external-module/openthread-tests.git/requirements.txt'"
             ),
         )
-        def initialize_workspace(manifest_url, manifest_rev, manifest_file, client_id, force, zephyr_path, post_init_command):
+        @click.option(
+            "--url",
+            help="URL to fetch a pre-built workspace archive (tar, tar.gz, tar.bz2, or tar.xz). When provided, skips west init/update.",
+        )
+        def initialize_workspace(manifest_url, manifest_rev, manifest_file, client_id, force, zephyr_path, post_init_command, url):
             """Initialize a Zephyr workspace on the exporter"""
             _stream_to_stdout(
                 self.initialize_workspace(
@@ -549,6 +557,7 @@ class WestClient(DriverClient):
                     force_recreate=force,
                     zephyr_path=zephyr_path,
                     post_init_command=post_init_command,
+                    url=url,
                 )
             )
 

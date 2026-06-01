@@ -9,6 +9,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from typing import AsyncGenerator
@@ -309,17 +310,23 @@ class West(Driver):
         force_recreate: bool = False,
         zephyr_path: str = "zephyr",
         post_init_command: str | None = None,
+        url: str | None = None,
     ) -> AsyncGenerator[str, None]:
-        """Initialize a Zephyr workspace using west init
+        """Initialize a Zephyr workspace using west init or from a URL
 
         Sets up a new Zephyr workspace on the exporter. This command:
         1. Generates a unique workspace identifier from manifest parameters
         2. Optionally deletes existing workspace if force_recreate=True
-        3. Runs 'west init' if the workspace doesn't exist
-        4. Creates a Python virtual environment for the workspace
-        5. Checks out a specific version if manifest_rev is provided
-        6. Runs 'west update' to fetch all dependencies
-        7. Optionally runs a user-defined shell command (post_init_command)
+        3. If url is provided:
+           - Downloads the workspace archive from the URL
+           - Extracts it to the workspace path
+           - Ensures the venv exists
+        4. If url is not provided:
+           - Runs 'west init' if the workspace doesn't exist
+           - Creates a Python virtual environment for the workspace
+           - Checks out a specific version if manifest_rev is provided
+           - Runs 'west update' to fetch all dependencies
+        5. Optionally runs a user-defined shell command (post_init_command)
 
         Args:
             manifest_url: Git repository URL for the manifest (default: Zephyr main repo)
@@ -332,6 +339,8 @@ class West(Driver):
             post_init_command: Shell command to run after west update completes. Runs via
                               `bash -c` with cwd=workspace_path and the venv activated.
                               Example: "pip install -r external-module/openthread-tests.git/requirements.txt"
+            url: URL to fetch a pre-built workspace archive (tar, tar.gz, tar.bz2, or tar.xz).
+                When provided, the workspace is fetched from this URL instead of running west init/update.
 
         Yields:
             Command output lines as they are produced.
@@ -371,46 +380,70 @@ class West(Driver):
         # Create workspace directory
         os.makedirs(workspace_path, exist_ok=True)
 
-        # Ensure the Python venv exists FIRST so every west invocation below uses
-        # the venv's `west` (and therefore the venv's Python as sys.executable).
-        async for line in self._ensure_venv(workspace_path):
-            yield line
+        # If URL is provided, fetch and extract the workspace from the URL
+        if url:
+            yield f"Fetching workspace from URL: {url}"
 
-        venv_bin = os.path.join(workspace_path, ".venv", "bin")
-        west_config = os.path.join(workspace_path, ".west")
+            with tempfile.NamedTemporaryFile(suffix=".tar", delete=True) as tmp:
+                # Download the archive
+                yield "Downloading workspace archive..."
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, urllib.request.urlretrieve, url, tmp.name)
+                yield "Download complete"
 
-        # Initialize west if not already done
-        if os.path.exists(west_config):
-            yield f"Workspace already initialized at {workspace_path}"
-        else:
-            cmd = [self.west_path, "init"]
-            if manifest_file:
-                cmd.extend(["-mf", manifest_file])
-            cmd.extend(["--mr", manifest_rev])
-            cmd.extend(["-m", manifest_url])
-            cmd.append(workspace_path)
+                # Extract the archive to the workspace path
+                yield f"Extracting workspace to {workspace_path}"
+                with tarfile.open(tmp.name, "r:*") as tar:
+                    tar.extractall(workspace_path)
+                yield "Extraction complete"
 
-            yield f"Initializing west workspace at {workspace_path}"
-            env = self._build_env(workspace_path, venv_bin, zephyr_base)
-            async for line in self._stream_cmd(cmd, cwd=workspace_path, env=env):
+            # Ensure the Python venv exists (it might be in the archive or need to be created)
+            async for line in self._ensure_venv(workspace_path):
                 yield line
 
-        # Checkout specific revision if workspace was already initialized
-        if manifest_rev and os.path.exists(west_config) and not force_recreate:
-            if os.path.exists(zephyr_base):
-                yield f"Checking out revision {manifest_rev}"
+            venv_bin = os.path.join(workspace_path, ".venv", "bin")
+        else:
+            # Standard west init workflow
+            # Ensure the Python venv exists FIRST so every west invocation below uses
+            # the venv's `west` (and therefore the venv's Python as sys.executable).
+            async for line in self._ensure_venv(workspace_path):
+                yield line
+
+            venv_bin = os.path.join(workspace_path, ".venv", "bin")
+            west_config = os.path.join(workspace_path, ".west")
+
+            # Initialize west if not already done
+            if os.path.exists(west_config):
+                yield f"Workspace already initialized at {workspace_path}"
+            else:
+                cmd = [self.west_path, "init"]
+                if manifest_file:
+                    cmd.extend(["-mf", manifest_file])
+                cmd.extend(["--mr", manifest_rev])
+                cmd.extend(["-m", manifest_url])
+                cmd.append(workspace_path)
+
+                yield f"Initializing west workspace at {workspace_path}"
                 env = self._build_env(workspace_path, venv_bin, zephyr_base)
-                async for line in self._stream_cmd(
-                    ["git", "checkout", manifest_rev],
-                    cwd=zephyr_base,
-                    env=env,
-                ):
+                async for line in self._stream_cmd(cmd, cwd=workspace_path, env=env):
                     yield line
 
-        # Run west update to fetch all dependencies
-        yield "Running west update..."
-        async for line in self._update_workspace_impl(workspace_path, venv_bin, zephyr_base):
-            yield line
+            # Checkout specific revision if workspace was already initialized
+            if manifest_rev and os.path.exists(west_config) and not force_recreate:
+                if os.path.exists(zephyr_base):
+                    yield f"Checking out revision {manifest_rev}"
+                    env = self._build_env(workspace_path, venv_bin, zephyr_base)
+                    async for line in self._stream_cmd(
+                        ["git", "checkout", manifest_rev],
+                        cwd=zephyr_base,
+                        env=env,
+                    ):
+                        yield line
+
+            # Run west update to fetch all dependencies
+            yield "Running west update..."
+            async for line in self._update_workspace_impl(workspace_path, venv_bin, zephyr_base):
+                yield line
 
         # Run user-defined post-init shell command if provided
         if post_init_command:
