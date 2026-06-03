@@ -1,0 +1,32 @@
+apiVersion: jumpstarter.dev/v1alpha1
+kind: ExporterConfig
+metadata:
+  namespace: default
+  name: demo
+endpoint: grpc.jumpstarter.192.168.0.203.nip.io:8082
+token: "<token>"
+export:
+  west:
+    type: jumpstarter_driver_west.driver.West
+    config:
+      # Required: Base directory for all West workspaces
+      # Individual workspaces are created as subdirectories based on:
+      # - Manifest URL (repo name extracted)
+      # - Manifest revision (version/branch/tag)
+      # - Optional client ID (to isolate different users/CI)
+      workspace_base: "/home/exporter/jumpstarter-workspaces"
+
+      # Optional: SDK path (shared across all workspaces)
+      # Can be installed via install_sdk command
+      sdk_path: "/opt/zephyr-sdk-0.16.5"
+
+      # Optional: Hardware map for twister testing
+      hardware_map: "/home/exporter/hardware-map.yaml"
+
+      # Optional: Configure flash runner and additional arguments
+      # The runner is controlled by the exporter admin, not by developers
+      extra_flash_args:
+        - "--runner"
+        - "openocd"  # or "jlink", "pyocd", etc.
+        # - "--openocd"  # Custom OpenOCD path if needed
+        # - "/custom/path/to/openocd"
